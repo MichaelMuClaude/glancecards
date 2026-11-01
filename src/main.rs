@@ -28,6 +28,8 @@ use settings::{Level, Settings, home_dir};
 const CARD_BG: Color32 = Color32::from_rgb(250, 247, 240);
 const EDGE: f32 = 7.0;
 const TOAST_SECS: u64 = 8;
+/// The longest a card waits after Look up for you to come back from the dictionary.
+const LOOKUP_HOLD: Duration = Duration::from_secs(60);
 
 /// Whether the interface is in Chinese. It is, unless no Chinese font can be found on the system.
 static ZH: AtomicBool = AtomicBool::new(false);
@@ -112,8 +114,9 @@ struct App {
     shown_at: Instant,
     /// When the card on screen first appeared. Unlike `shown_at`, hovering does not reset it.
     shown_since: Instant,
-    /// Set by "Look up": the card stays until the pointer comes back over it, or Next is used.
-    hold: bool,
+    /// Set by "Look up" (when it was clicked): the card stays until the pointer comes back over it, Next is
+    /// used, or `LOOKUP_HOLD` has passed.
+    hold: Option<Instant>,
     interval: Duration,
     paused: bool,
     toast: Option<(String, Instant, bool)>,
@@ -151,7 +154,7 @@ impl App {
             shown: None,
             shown_at: Instant::now(),
             shown_since: Instant::now(),
-            hold: false,
+            hold: None,
             interval: cfg.interval,
             paused: false,
             toast: None,
@@ -321,7 +324,7 @@ impl App {
         }
         // Prevent the auto-advance timer from firing again before the new photo shows.
         self.shown_at = Instant::now();
-        self.hold = false;
+        self.hold = None;
     }
 
     /// Goes back to the photo that was on screen just before this one.
@@ -332,7 +335,7 @@ impl App {
             if let Some(i) = before.or_else(|| self.queue.iter().position(|q| *q == p)) {
                 self.pos = i;
                 self.shown_at = Instant::now();
-                self.hold = false;
+                self.hold = None;
                 return;
             }
         }
@@ -641,7 +644,13 @@ impl eframe::App for App {
             // Hold the timer so the photo gets a full interval once the pointer leaves.
             self.shown_at = Instant::now();
         }
-        if !self.paused && !self.hold && !self.busy() && showing_current && self.shown_at.elapsed() >= self.card_interval() && self.queue.len() > 1 {
+        // Stop waiting for the return from the dictionary after a while (the pointer may come back without
+        // crossing the card, or the window may never notice it left); the card then gets a full interval.
+        if self.hold.is_some_and(|t| t.elapsed() >= LOOKUP_HOLD) {
+            self.hold = None;
+            self.shown_at = Instant::now();
+        }
+        if !self.paused && self.hold.is_none() && !self.busy() && showing_current && self.shown_at.elapsed() >= self.card_interval() && self.queue.len() > 1 {
             self.step(true);
         }
 
@@ -727,7 +736,7 @@ impl eframe::App for App {
         let overlay = shown_rect.unwrap_or(photo_area);
         let hovering = shown_rect.zip(pointer).is_some_and(|(r, p)| r.contains(p));
         if hovering && !self.hover_photo {
-            self.hold = false; // back from the dictionary
+            self.hold = None; // back from the dictionary
         }
         self.hover_photo = hovering;
         // Ignore button clicks on a card that has only just appeared: the second click of a quick double
@@ -788,9 +797,9 @@ impl eframe::App for App {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
                 }
                 if resp.clicked() && settled {
-                    self.hold = true;
+                    self.hold = Some(Instant::now());
                     if let Err(e) = open_url(&cambridge_url(&word)) {
-                        self.hold = false;
+                        self.hold = None;
                         self.toast = Some((format!("{}: {e}", tr("打不开浏览器", "Could not open the browser")), Instant::now(), false));
                     }
                 }
