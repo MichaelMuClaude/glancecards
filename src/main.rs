@@ -735,6 +735,26 @@ impl eframe::App for App {
             if resp.clicked() {
                 self.mark_known();
             }
+            // "Don't know" button: opens the word in the Cambridge English–Chinese dictionary.
+            if let Some(word) = self.shown.as_ref().and_then(|(p, _)| card_word(p)) {
+                let btn = Rect::from_min_size(overlay.left_top() + vec2(8.0, 8.0), vec2(76.0, 28.0));
+                let resp = ui.interact(btn, Id::new("unknown"), Sense::click());
+                let fill = if resp.hovered() {
+                    Color32::from_rgb(215, 95, 45)
+                } else {
+                    Color32::from_rgba_unmultiplied(190, 80, 35, 215)
+                };
+                painter.rect_filled(btn, 6.0, fill);
+                painter.text(btn.center(), Align2::CENTER_CENTER, tr("不认识", "Look up"), FontId::proportional(14.0), Color32::WHITE);
+                if resp.hovered() {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    if let Err(e) = open_url(&cambridge_url(&word)) {
+                        self.toast = Some((format!("{}: {e}", tr("打不开浏览器", "Could not open the browser")), Instant::now(), false));
+                    }
+                }
+            }
         }
 
         // Toast with Undo.
@@ -780,6 +800,59 @@ fn unique_path(p: &Path) -> PathBuf {
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|c| !c.exists())
         .expect("an unused name exists")
+}
+
+/// The word a card shows, taken from its file name: "apple.png", "wa_according-to.jpg",
+/// or "apple (2).png" after a name clash in the known folder.
+fn card_word(p: &Path) -> Option<String> {
+    let stem = p.file_stem()?.to_string_lossy();
+    let stem = stem.strip_prefix("wa_").unwrap_or(&stem);
+    let stem = match stem.rfind(" (") {
+        Some(i) if stem.ends_with(')') => &stem[..i],
+        _ => stem,
+    };
+    let word = stem.trim();
+    (!word.is_empty()).then(|| word.to_string())
+}
+
+/// Cambridge's direct search jumps to the entry, or to its spelling suggestions when there is none.
+fn cambridge_url(word: &str) -> String {
+    let q: String = word
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
+            b' ' => "+".to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("https://dictionary.cambridge.org/search/direct/?datasetsearch=english-chinese-simplified&q={q}")
+}
+
+/// Opens a web page in the default browser without waiting for it.
+fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let mut cmd = {
+        // rundll32 takes the URL as one argument, so "&" in it is not read by a shell.
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let mut child = cmd.spawn()?;
+    // Reap the launcher when it exits so it does not linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// Renames, or copies and deletes when the folders are on different drives.
