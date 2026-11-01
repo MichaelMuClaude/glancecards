@@ -242,9 +242,8 @@ impl App {
                 }
             }
         }
-        while let Ok(mut batch) = self.scan_rx.try_recv() {
-            batch.shuffle(&mut rand::rng());
-            self.queue = batch;
+        while let Ok(batch) = self.scan_rx.try_recv() {
+            self.queue = arrange(batch, self.settings.sentence_every);
             self.pos = 0;
             self.scanned = true;
         }
@@ -276,16 +275,22 @@ impl App {
         }
     }
 
+    /// Removes every copy of the card (sentence cards appear several times in a round).
     fn remove_from_queue(&mut self, path: &PathBuf) {
-        if let Some(i) = self.queue.iter().position(|p| p == path) {
+        while let Some(i) = self.queue.iter().position(|p| p == path) {
             self.queue.remove(i);
             if i < self.pos {
                 self.pos -= 1;
             }
-            if self.pos >= self.queue.len() {
-                self.pos = 0;
-            }
         }
+        if self.pos >= self.queue.len() {
+            self.pos = 0;
+        }
+    }
+
+    /// How long the card on screen stays: sentences take longer to read, so they get twice as long.
+    fn card_interval(&self) -> Duration {
+        if self.current_path().is_some_and(|p| is_sentence(p)) { self.interval * 2 } else { self.interval }
     }
 
     fn step(&mut self, forward: bool) {
@@ -305,7 +310,7 @@ impl App {
             self.pos += 1;
             if self.pos >= n {
                 self.pos = 0;
-                self.queue.shuffle(&mut rand::rng());
+                self.queue = arrange(std::mem::take(&mut self.queue), self.settings.sentence_every);
                 // A new round must not start with the card that ended the last one.
                 if n > 1 && self.shown.as_ref().is_some_and(|(p, _)| *p == self.queue[0]) {
                     self.queue.swap(0, n - 1);
@@ -322,7 +327,9 @@ impl App {
     /// Goes back to the photo that was on screen just before this one.
     fn go_back(&mut self) {
         while let Some(p) = self.history.pop() {
-            if let Some(i) = self.queue.iter().position(|q| *q == p) {
+            // A sentence card is in the queue several times: take the copy just before this card.
+            let before = self.queue[..self.pos.min(self.queue.len())].iter().rposition(|q| *q == p);
+            if let Some(i) = before.or_else(|| self.queue.iter().position(|q| *q == p)) {
                 self.pos = i;
                 self.shown_at = Instant::now();
                 self.hold = false;
@@ -454,6 +461,7 @@ impl App {
             .with_min_inner_size([400.0, 380.0]);
         let dirs = self.dirs.clone();
         let mut secs = self.interval.as_secs();
+        let mut every = self.settings.sentence_every;
         let mut fit = self.fit;
         let mut level = self.level;
         let wayland = is_wayland();
@@ -480,6 +488,11 @@ impl App {
                     ui.label(tr("每隔", "Change card every"));
                     ui.add(egui::DragValue::new(&mut secs).range(1..=3600).suffix(tr(" 秒", " s")));
                     ui.label(tr("换一张卡片", ""));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("句子卡：每", "Sentence cards: one after every"));
+                    ui.add(egui::DragValue::new(&mut every).range(0..=100));
+                    ui.label(tr("张单词卡后出一张（0 = 不特别安排）", "word cards (0 = no special place)"));
                 });
                 ui.checkbox(&mut fit, tr("窗口贴合每张卡片的形状", "Fit the window to each card's shape"));
                 ui.separator();
@@ -516,6 +529,11 @@ impl App {
         if secs != self.interval.as_secs() {
             self.interval = Duration::from_secs(secs.max(1));
             self.settings.interval = secs.max(1);
+            settings::save(&self.settings);
+        }
+        if every != self.settings.sentence_every {
+            // Takes effect when the next round is shuffled.
+            self.settings.sentence_every = every;
             settings::save(&self.settings);
         }
         if fit != self.fit {
@@ -623,7 +641,7 @@ impl eframe::App for App {
             // Hold the timer so the photo gets a full interval once the pointer leaves.
             self.shown_at = Instant::now();
         }
-        if !self.paused && !self.hold && !self.busy() && showing_current && self.shown_at.elapsed() >= self.interval && self.queue.len() > 1 {
+        if !self.paused && !self.hold && !self.busy() && showing_current && self.shown_at.elapsed() >= self.card_interval() && self.queue.len() > 1 {
             self.step(true);
         }
 
@@ -824,10 +842,51 @@ fn unique_path(p: &Path) -> PathBuf {
         .expect("an unused name exists")
 }
 
+/// Sentence cards are named "sentence_<id>_<key-phrase>.png".
+fn is_sentence(p: &Path) -> bool {
+    p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("sentence_"))
+}
+
+/// Shuffles the cards for a new round and spreads the sentence cards through it: one after every `every`
+/// word cards, going round the sentences again and again, so a handful of sentences come back often
+/// instead of once in thousands of cards. `every` = 0 shuffles them in like any other card, once each.
+fn arrange(cards: Vec<PathBuf>, every: usize) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let (mut sentences, mut words): (Vec<_>, Vec<_>) =
+        cards.into_iter().filter(|p| seen.insert(p.clone())).partition(|p| is_sentence(p));
+    let rng = &mut rand::rng();
+    if every == 0 || sentences.is_empty() || words.is_empty() {
+        words.append(&mut sentences);
+        words.shuffle(rng);
+        return words;
+    }
+    sentences.shuffle(rng);
+    words.shuffle(rng);
+    let n = words.len();
+    let slots = (n / every).max(sentences.len());
+    let mut out = Vec::with_capacity(n + slots);
+    let mut placed = 0;
+    for (i, w) in words.into_iter().enumerate() {
+        out.push(w);
+        while placed < slots && (placed + 1) * n / slots <= i + 1 {
+            out.push(sentences[placed % sentences.len()].clone());
+            placed += 1;
+        }
+    }
+    out
+}
+
 /// The word a card shows, taken from its file name: "apple.png", "wa_according-to.jpg",
-/// or "apple (2).png" after a name clash in the known folder.
+/// or "apple (2).png" after a name clash in the known folder. A sentence card gives its key phrase
+/// ("sentence_005_figure-out.png" is "figure out").
 fn card_word(p: &Path) -> Option<String> {
     let stem = p.file_stem()?.to_string_lossy();
+    if let Some(rest) = stem.strip_prefix("sentence_") {
+        let phrase = rest.split_once('_').map_or(rest, |(_, k)| k);
+        let phrase = phrase.split(" (").next().unwrap_or(phrase).replace('-', " ");
+        let phrase = phrase.trim();
+        return (!phrase.is_empty()).then(|| phrase.to_string());
+    }
     let stem = stem.strip_prefix("wa_").unwrap_or(&stem);
     let stem = match stem.rfind(" (") {
         Some(i) if stem.ends_with(')') => &stem[..i],
@@ -972,6 +1031,26 @@ mod tests {
         assert_eq!(card_word(Path::new("/x/wa_according-to.jpg")).as_deref(), Some("according-to"));
         assert_eq!(card_word(Path::new("/x/apple (2).png")).as_deref(), Some("apple"));
         assert_eq!(card_word(Path::new("/x/wa_.jpg")), None);
+        assert_eq!(card_word(Path::new("/x/sentence_005_figure-out.png")).as_deref(), Some("figure out"));
+        assert_eq!(card_word(Path::new("/x/sentence_002_take-a-break (1).png")).as_deref(), Some("take a break"));
+    }
+
+    #[test]
+    fn sentences_are_spread_through_the_round() {
+        let words: Vec<PathBuf> = (0..100).map(|i| PathBuf::from(format!("w{i}.png"))).collect();
+        let sentences: Vec<PathBuf> = (1..=3).map(|i| PathBuf::from(format!("sentence_00{i}_x.png"))).collect();
+        let all: Vec<PathBuf> = words.iter().chain(&sentences).cloned().collect();
+        let q = arrange(all.clone(), 5);
+        assert_eq!(q.len(), 120);
+        assert_eq!(q.iter().filter(|p| !is_sentence(p)).count(), 100);
+        // Never two sentences in a row, and every sentence comes back several times.
+        assert!(q.windows(2).all(|w| !(is_sentence(&w[0]) && is_sentence(&w[1]))));
+        assert!(sentences.iter().all(|s| q.iter().filter(|p| *p == s).count() >= 6));
+        // A round that already holds repeats is rebuilt from one copy of each card.
+        assert_eq!(arrange(q, 5).len(), 120);
+        // 0 turns it off; fewer words than `every` still shows each sentence once.
+        assert_eq!(arrange(all, 0).len(), 103);
+        assert_eq!(arrange(vec![words[0].clone()].into_iter().chain(sentences.clone()).collect(), 5).len(), 4);
     }
 
     #[test]

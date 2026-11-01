@@ -33,13 +33,15 @@ pub struct Settings {
     /// Where cards you already know are moved to; `None` means a `known` folder next to the first source folder.
     pub known: Option<PathBuf>,
     pub interval: u64,
+    /// A sentence card (`sentence_*`) comes after this many word cards; 0 = shuffled in like the others.
+    pub sentence_every: usize,
     pub fit: bool,
     pub level: Level,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), recent: Vec::new(), known: None, interval: 10, fit: true, level: Level::Bottom }
+        Self { dirs: Vec::new(), recent: Vec::new(), known: None, interval: 10, sentence_every: 5, fit: true, level: Level::Bottom }
     }
 }
 
@@ -69,6 +71,11 @@ pub fn load() -> Settings {
                     st.interval = n.clamp(1, 3600);
                 }
             }
+            "sentence_every" => {
+                if let Ok(n) = value.trim().parse::<usize>() {
+                    st.sentence_every = n.min(100);
+                }
+            }
             "fit" => st.fit = value.trim() != "0",
             "level" => {
                 st.level = match value.trim() {
@@ -95,7 +102,13 @@ pub fn save(st: &Settings) {
     if let Some(k) = &st.known {
         out.push_str(&format!("known={}\n", k.display()));
     }
-    out.push_str(&format!("interval={}\nfit={}\nlevel={}\n", st.interval, u8::from(st.fit), st.level.name()));
+    out.push_str(&format!(
+        "interval={}\nsentence_every={}\nfit={}\nlevel={}\n",
+        st.interval,
+        st.sentence_every,
+        u8::from(st.fit),
+        st.level.name()
+    ));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
