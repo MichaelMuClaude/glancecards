@@ -19,6 +19,9 @@ use crate::settings::Settings;
 const PAGE: &str = include_str!("../web/index.html");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 const ICON: &[u8] = include_bytes!("../web/icon.png");
+const WORKER: &str = include_str!("../web/sw.js");
+/// The most cards one `/api/next?n=` call hands out.
+const MAX_BATCH: usize = 50;
 /// Cards are sent as JPEGs this wide: plenty for a phone, and about a tenth of the PNG.
 const IMG_WIDTH: u32 = 720;
 /// How often to look for cards added or removed behind our back (new sentence cards, Got it on the desktop).
@@ -139,11 +142,21 @@ fn handle(req: Request, state: &Mutex<State>) {
         (Method::Get, "/") => text(PAGE, "text/html; charset=utf-8"),
         (Method::Get, "/manifest.webmanifest") => text(MANIFEST, "application/manifest+json"),
         (Method::Get, "/icon.png") => bytes(ICON.to_vec(), "image/png"),
+        (Method::Get, "/sw.js") => {
+            text(WORKER, "text/javascript; charset=utf-8").with_header(header("Cache-Control", "no-cache"))
+        }
         (Method::Get, "/api/next") => {
             let mut s = lock(state);
-            match s.next() {
-                Some(p) => text(&s.card_json(&p), "application/json"),
-                None => text(r#"{"error":"没有卡片"}"#, "application/json").with_status_code(404),
+            // `?n=10` hands out up to 50 cards at once (as a list), so the phone can keep some ahead.
+            let batch = param(query, "n").and_then(|n| n.parse::<usize>().ok()).map(|n| n.clamp(1, MAX_BATCH));
+            let picked: Vec<PathBuf> = (0..batch.unwrap_or(1)).map_while(|_| s.next()).collect();
+            let cards: Vec<String> = picked.iter().map(|p| s.card_json(p)).collect();
+            if cards.is_empty() {
+                text(r#"{"error":"没有卡片"}"#, "application/json").with_status_code(404)
+            } else if batch.is_some() {
+                text(&format!("[{}]", cards.join(",")), "application/json")
+            } else {
+                text(&cards[0], "application/json")
             }
         }
         (Method::Get, "/img") => {

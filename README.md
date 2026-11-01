@@ -65,9 +65,14 @@ them on a phone like a short-video app:
 - **tap**: pause or carry on; **Look up** (不认识) opens the Cambridge dictionary;
 - left alone, it moves on by itself (sentence cards stay twice as long) and keeps the screen on.
 
-The cards stay on the computer: the phone asks for one card at a time and gets it as a small JPEG
-(about 70 KB instead of a 1 MB PNG). Got it on the phone moves the real file, so the window and the phone
-share one set of cards, and new cards in the folder show up on the phone within 5 minutes.
+The cards stay on the computer: the phone gets each card as a small JPEG (about 70 KB instead of a 1 MB PNG).
+Got it on the phone moves the real file, so the window and the phone share one set of cards, and new cards in
+the folder show up on the phone within 5 minutes.
+
+The phone also keeps the next 50 cards on itself (a service worker and the browser's cache, about 4 MB), so
+the cards keep coming when the computer is off or there is no connection. A Got it made meanwhile is queued
+and sent when the computer can be reached again (Undo works for it too); the page says so at the bottom. The
+page needs one visit with a connection first, to fill its store.
 
 The page has **no sign-in**: anyone who can reach it can move your cards. Keep it on `127.0.0.1` and reach it
 through something that lets in only your own devices and adds HTTPS (needed for "Add to Home Screen" as an

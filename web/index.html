@@ -89,6 +89,7 @@
   <p><b>点一下</b>：暂停 / 继续自动播放</p>
   <p><b>不认识</b>：打开剑桥词典查这个词</p>
   <p>不碰它的时候，每 10 秒自动换一张，句子卡停 20 秒。</p>
+  <p>手机会提前存好 50 张，电脑关机、没网也能接着刷；划掉的会等连上后再告诉电脑。</p>
   <button id="helpok">知道了</button>
 </div></div>
 <script>
@@ -97,16 +98,29 @@ const $ = (id) => document.getElementById(id);
 const stage = $("stage"), barFill = document.querySelector("#bar i"), statusEl = $("status");
 const HOLD_MAX = 60000;      // the longest a card waits after Look up
 const MAX_HISTORY = 60;
+const TARGET = 50;           // cards kept on the phone ahead of the one on screen
+const LOW = 30;              // fetch more when fewer than this are left
+const BATCH = 10;
+const CARDS = "cards-v1";    // the picture cache (sw.js serves from it)
 
-let history = [];            // cards shown, oldest first: {id, word, lookup, featured, seconds, url}
+let history = [];            // cards shown, oldest first: {id, word, lookup, featured, seconds}
 let idx = -1;                // which history card is on screen
-let upcoming = null;         // a promise of the next new card, fetched ahead
+let buffer = load("buffer", []);    // cards still to come, their pictures already saved on the phone
+let pending = load("pending", []);  // cards marked known that the computer has not been told about yet
+let lastKnown = null;        // the card the Undo button would bring back
+let offline = false;
 let curEl = null;
 let paused = false, holdSince = 0, busy = false;
 let elapsed = 0, lastFrame = performance.now();   // ms the card has been on screen while playing
 let toastTimer = 0, wakeLock = null;
 
-function store(key, value) {
+function load(key, fallback) {
+  try { const v = JSON.parse(localStorage.getItem(key)); return Array.isArray(v) ? v : fallback; } catch (e) { return fallback; }
+}
+function save(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode or full: carry on without */ }
+}
+function flag(key, value) {
   try { if (value === undefined) return localStorage.getItem(key); localStorage.setItem(key, value); } catch (e) { return null; }
 }
 
@@ -121,26 +135,111 @@ function loadImage(url) {
   });
 }
 
-async function fetchCard() {
-  const res = await fetch("/api/next", { cache: "no-store" });
+// --- cards ahead, kept on the phone ---
+
+async function fetchBatch(n) {
+  const res = await fetch("/api/next?n=" + n, { cache: "no-store" });
+  if (res.status === 404) return [];
   if (!res.ok) throw new Error("next " + res.status);
-  const card = await res.json();
-  card.url = imgUrl(card);
-  await loadImage(card.url);   // so it shows at once when its turn comes
-  return card;
+  return res.json();
 }
 
-function prefetch() {
-  upcoming = fetchCard();
-  upcoming.catch(() => {});
+// Saves the card's picture on the phone (in the cache sw.js serves from).
+async function preload(card) {
+  const url = imgUrl(card);
+  if (!("caches" in window)) { await loadImage(url); return; }
+  const cache = await caches.open(CARDS);
+  if (await cache.match(url)) return;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("img " + res.status);
+  await cache.put(url, res);
 }
+
+let refilling = null;
+function refill() {
+  if (refilling) return refilling;
+  refilling = (async () => {
+    try {
+      while (buffer.length < TARGET) {
+        const cards = await fetchBatch(Math.min(BATCH, TARGET - buffer.length));
+        setOffline(false);
+        if (!cards.length) break;
+        for (let i = 0; i < cards.length; i += 3) {        // three pictures at a time
+          await Promise.all(cards.slice(i, i + 3).map((c) => preload(c).then(() => buffer.push(c), () => {})));
+          save("buffer", buffer);
+          updateStatus();
+        }
+      }
+    } catch (e) {
+      setOffline(true);
+    } finally {
+      refilling = null;
+      trimCache();
+    }
+  })();
+  return refilling;
+}
+
+// Throws away saved pictures of cards that are neither on screen, behind us, ahead, nor about to be undone.
+async function trimCache() {
+  if (!("caches" in window)) return;
+  try {
+    const keep = new Set([...history, ...buffer, ...(lastKnown ? [lastKnown.card] : [])].map((c) => c.id));
+    const cache = await caches.open(CARDS);
+    for (const req of await cache.keys()) {
+      if (!keep.has(new URL(req.url).searchParams.get("f"))) await cache.delete(req);
+    }
+  } catch (e) { /* the cache is only a convenience */ }
+}
+
+function setOffline(value) {
+  if (offline !== value) { offline = value; updateStatus(); }
+}
+
+// Removes every copy of a card from what is behind and ahead (a sentence card can be queued more than once).
+// Only meant for the card on screen: idx then points just before the card that follows it.
+function forget(card) {
+  const before = history.slice(0, idx).filter((c) => c.id !== card.id).length;
+  history = history.filter((c) => c.id !== card.id);
+  idx = before - 1;
+  buffer = buffer.filter((c) => c.id !== card.id);
+  save("buffer", buffer);
+}
+
+// --- Got it, told to the computer as soon as it can be reached ---
+
+let flushing = null;
+function flushPending() {
+  if (flushing) return flushing;
+  flushing = (async () => {
+    try {
+      while (pending.length) {
+        const res = await fetch("/api/known?f=" + encodeURIComponent(pending[0]), { method: "POST" });
+        if (!res.ok && res.status !== 404) break;       // 404: already gone from the computer's folder
+        pending.shift();
+        save("pending", pending);
+        setOffline(false);
+      }
+    } catch (e) {
+      setOffline(true);
+    } finally {
+      flushing = null;
+      updateStatus();
+    }
+  })();
+  return flushing;
+}
+
+// --- the card on screen ---
 
 function makeCardEl(card) {
   const el = document.createElement("div");
   el.className = "card";
   const img = document.createElement("img");
-  img.src = card.url;
   img.alt = card.word;
+  // A card whose picture cannot be had (moved away on the computer, saved copy lost) is skipped.
+  img.onerror = () => { if (el === curEl && !busy) { forget(card); next(); } };
+  img.src = imgUrl(card);
   el.appendChild(img);
   const stamp = document.createElement("div");
   stamp.className = "stamp";
@@ -189,18 +288,29 @@ async function next() {
     if (idx < history.length - 1) {
       idx += 1;
     } else {
-      const card = await (upcoming || fetchCard());
+      if (!buffer.length) {
+        // Nothing saved ahead: ask for one card now, the rest fills in behind it.
+        try {
+          const [first] = await fetchBatch(1);
+          if (first) { await preload(first); buffer.push(first); }
+          setOffline(false);
+        } catch (e) { setOffline(true); }
+      }
+      const card = buffer.shift();
+      if (!card) throw new Error("empty");
+      save("buffer", buffer);
       history.push(card);
       if (history.length > MAX_HISTORY) history.shift();
       idx = history.length - 1;
-      prefetch();
+      if (buffer.length < LOW) refill();
     }
     showMessage("");
     place(current(), curEl ? "below" : "none");
   } catch (e) {
-    upcoming = null;
-    if (!curEl) showMessage("连不上电脑上的词卡，5 秒后自动重试…");
-    setTimeout(() => { if (!curEl) next(); }, 5000);
+    if (!curEl) {
+      showMessage(offline ? "连不上电脑，手机里也没有存好的卡片。5 秒后自动重试…" : "没有卡片了。5 秒后自动重试…");
+      setTimeout(() => { if (!curEl) next(); }, 5000);
+    }
   } finally {
     busy = false;
   }
@@ -225,37 +335,42 @@ async function markKnown(dir) {
   el.classList.add("anim");
   el.style.transform = `translateX(${dir * 120}%) rotate(${dir * 12}deg)`;
   el.style.opacity = "0";
-  try {
-    const res = await fetch("/api/known?f=" + encodeURIComponent(card.id), { method: "POST" });
-    if (!res.ok) throw new Error("known " + res.status);
-  } catch (e) {
-    el.style.transform = "none";
-    el.style.opacity = "1";
-    flash("没移成，电脑那边出错了");
-    return;
-  }
-  // Forget the card, so going back never shows it again; the next card slides in from below.
-  history.splice(idx, 1);
-  idx -= 1;
+  forget(card);
   setTimeout(() => el.remove(), 300);
+  if (!pending.includes(card.id)) pending.push(card.id);
+  save("pending", pending);
+  lastKnown = { card };
+  flushPending();
   showToast();
   await next();
 }
 
 async function undo() {
   hideToast();
-  try {
-    const res = await fetch("/api/undo", { method: "POST" });
-    if (!res.ok) throw new Error("undo " + res.status);
-    const card = await res.json();
-    card.url = imgUrl(card);
-    await loadImage(card.url);
-    history.splice(idx + 1, 0, card);
-    idx += 1;
-    place(card, "above");
-  } catch (e) {
-    flash("撤销失败");
+  const k = lastKnown;
+  if (!k) return;
+  if (flushing) await flushing;
+  let card = k.card;
+  const at = pending.indexOf(card.id);
+  if (at >= 0) {
+    // The computer was never told: just take it back.
+    pending.splice(at, 1);
+    save("pending", pending);
+  } else {
+    try {
+      const res = await fetch("/api/undo", { method: "POST" });
+      if (!res.ok) throw new Error("undo " + res.status);
+      card = await res.json();
+    } catch (e) {
+      flash("要连上电脑才能撤销");
+      return;
+    }
   }
+  lastKnown = null;
+  try { await preload(card); } catch (e) { /* shown from the network if it can be */ }
+  history.splice(idx + 1, 0, card);
+  idx += 1;
+  place(card, "above");
 }
 
 function showToast() {
@@ -271,7 +386,12 @@ function flash(text) {
 }
 
 function updateStatus() {
-  statusEl.textContent = paused ? "已暂停 · 点一下继续" : holdSince ? "查完词回来会接着播放" : "";
+  const parts = [];
+  if (paused) parts.push("已暂停 · 点一下继续");
+  else if (holdSince) parts.push("查完词回来会接着播放");
+  if (offline) parts.push(`连不上电脑 · 手机里存着 ${buffer.length} 张`);
+  if (pending.length) parts.push(`${pending.length} 个"认识了"等连上后同步`);
+  statusEl.textContent = parts.join(" · ");
 }
 
 function lookUp() {
@@ -359,17 +479,26 @@ async function requestWakeLock() {
   } catch (e) { wakeLock = null; }
 }
 
+// Back on the computer's network, or back in the app: tell it what was marked, top up the cards ahead.
+function sync() {
+  if (pending.length) flushPending();
+  if (offline || buffer.length < LOW) refill();
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     if (holdSince) { holdSince = 0; restartTimer(); updateStatus(); }  // back from the dictionary
     requestWakeLock();
+    sync();
   }
 });
+window.addEventListener("online", sync);
+setInterval(sync, 20000);
 
 $("lookup").addEventListener("click", lookUp);
 $("known").addEventListener("click", () => markKnown(1));
 $("undo").addEventListener("click", undo);
-$("helpok").addEventListener("click", () => { $("help").style.display = "none"; store("help-seen", "1"); requestWakeLock(); });
+$("helpok").addEventListener("click", () => { $("help").style.display = "none"; flag("help-seen", "1"); requestWakeLock(); });
 document.addEventListener("keydown", (e) => {
   // A keyboard on a computer: up = next, down = previous, K = got it, space = pause.
   if (e.key === "ArrowUp") next();
@@ -378,9 +507,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key === " ") { paused = !paused; updateStatus(); }
 });
 
-if (store("help-seen") !== "1") $("help").style.display = "flex";
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+if (flag("help-seen") !== "1") $("help").style.display = "flex";
 showMessage("正在加载…");
 next();
+sync();
 requestAnimationFrame(tick);
 requestWakeLock();
 </script>
