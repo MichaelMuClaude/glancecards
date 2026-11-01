@@ -48,7 +48,11 @@ pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) 
             loop {
                 let job = job_rx.lock().ok().and_then(|rx| rx.recv().ok());
                 let Some(path) = job else { break };
-                let msg = match decode(&path) {
+                // A decoder that panics on a broken file must not take the worker down with it: the card
+                // would stay "loading" forever and the slideshow would stop on it.
+                let result = std::panic::catch_unwind(|| decode(&path))
+                    .unwrap_or_else(|_| Err("the decoder crashed on this file".to_string()));
+                let msg = match result {
                     Ok(img) => Loaded::Ok(path, img),
                     Err(e) => Loaded::Err(path, e),
                 };

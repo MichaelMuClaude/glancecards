@@ -110,6 +110,10 @@ struct App {
     pending: HashSet<PathBuf>,
     shown: Option<(PathBuf, TextureHandle)>,
     shown_at: Instant,
+    /// When the card on screen first appeared. Unlike `shown_at`, hovering does not reset it.
+    shown_since: Instant,
+    /// Set by "Look up": the card stays until the pointer comes back over it, or Next is used.
+    hold: bool,
     interval: Duration,
     paused: bool,
     toast: Option<(String, Instant, bool)>,
@@ -146,6 +150,8 @@ impl App {
             pending: HashSet::new(),
             shown: None,
             shown_at: Instant::now(),
+            shown_since: Instant::now(),
+            hold: false,
             interval: cfg.interval,
             paused: false,
             toast: None,
@@ -264,6 +270,7 @@ impl App {
                     self.fit_aspect = Some(tex.aspect_ratio());
                     self.shown = Some((p, tex.clone()));
                     self.shown_at = Instant::now();
+                    self.shown_since = Instant::now();
                 }
             }
         }
@@ -299,12 +306,17 @@ impl App {
             if self.pos >= n {
                 self.pos = 0;
                 self.queue.shuffle(&mut rand::rng());
+                // A new round must not start with the card that ended the last one.
+                if n > 1 && self.shown.as_ref().is_some_and(|(p, _)| *p == self.queue[0]) {
+                    self.queue.swap(0, n - 1);
+                }
             }
         } else {
             self.pos = (self.pos + n - 1) % n;
         }
         // Prevent the auto-advance timer from firing again before the new photo shows.
         self.shown_at = Instant::now();
+        self.hold = false;
     }
 
     /// Goes back to the photo that was on screen just before this one.
@@ -313,6 +325,7 @@ impl App {
             if let Some(i) = self.queue.iter().position(|q| *q == p) {
                 self.pos = i;
                 self.shown_at = Instant::now();
+                self.hold = false;
                 return;
             }
         }
@@ -596,7 +609,8 @@ impl eframe::App for App {
         if prev {
             self.go_back();
         }
-        if del {
+        // Holding Delete repeats the key; one card per key press, not a run of them.
+        if del && self.shown_since.elapsed() >= Duration::from_millis(400) {
             self.mark_known();
         }
         if pause {
@@ -609,7 +623,7 @@ impl eframe::App for App {
             // Hold the timer so the photo gets a full interval once the pointer leaves.
             self.shown_at = Instant::now();
         }
-        if !self.paused && !self.busy() && showing_current && self.shown_at.elapsed() >= self.interval && self.queue.len() > 1 {
+        if !self.paused && !self.hold && !self.busy() && showing_current && self.shown_at.elapsed() >= self.interval && self.queue.len() > 1 {
             self.step(true);
         }
 
@@ -694,7 +708,13 @@ impl eframe::App for App {
         // Hover overlay (only while the pointer is over the photo itself): file name and the Got it button.
         let overlay = shown_rect.unwrap_or(photo_area);
         let hovering = shown_rect.zip(pointer).is_some_and(|(r, p)| r.contains(p));
+        if hovering && !self.hover_photo {
+            self.hold = false; // back from the dictionary
+        }
         self.hover_photo = hovering;
+        // Ignore button clicks on a card that has only just appeared: the second click of a quick double
+        // click would otherwise land on the next card's button.
+        let settled = self.shown_since.elapsed() >= Duration::from_millis(400);
         if hovering && self.shown.is_some() {
             if let Some((path, _)) = &self.shown {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -732,7 +752,7 @@ impl eframe::App for App {
             if resp.hovered() {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
             }
-            if resp.clicked() {
+            if resp.clicked() && settled {
                 self.mark_known();
             }
             // "Don't know" button: opens the word in the Cambridge English–Chinese dictionary.
@@ -749,8 +769,10 @@ impl eframe::App for App {
                 if resp.hovered() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
                 }
-                if resp.clicked() {
+                if resp.clicked() && settled {
+                    self.hold = true;
                     if let Err(e) = open_url(&cambridge_url(&word)) {
+                        self.hold = false;
                         self.toast = Some((format!("{}: {e}", tr("打不开浏览器", "Could not open the browser")), Instant::now(), false));
                     }
                 }
@@ -861,7 +883,12 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::copy(from, to)?;
-    std::fs::remove_file(from)
+    if let Err(e) = std::fs::remove_file(from) {
+        // Leave one copy, not two: the card stays where it was.
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Wayland compositors (GNOME, KDE) have no "stay below other windows" level, so there the
@@ -910,6 +937,11 @@ fn parse_args(st: &Settings) -> Config {
 fn main() -> eframe::Result {
     let st = settings::load();
     let cfg = parse_args(&st);
+    // Keep the lock until the app quits.
+    let Some(_lock) = settings::single_instance() else {
+        eprintln!("GlanceCards (词卡) is already running.");
+        return Ok(());
+    };
     let level = window_level(cfg.level);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -928,4 +960,37 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, cfg.take().expect("single init"))))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_from_file_name() {
+        assert_eq!(card_word(Path::new("/x/apple.png")).as_deref(), Some("apple"));
+        assert_eq!(card_word(Path::new("/x/wa_according-to.jpg")).as_deref(), Some("according-to"));
+        assert_eq!(card_word(Path::new("/x/apple (2).png")).as_deref(), Some("apple"));
+        assert_eq!(card_word(Path::new("/x/wa_.jpg")), None);
+    }
+
+    #[test]
+    fn cambridge_query_is_encoded() {
+        assert!(cambridge_url("according-to").ends_with("&q=according-to"));
+        assert!(cambridge_url("ice cream").ends_with("&q=ice+cream"));
+        assert!(cambridge_url("o'clock&x").ends_with("&q=o%27clock%26x"));
+        assert!(cambridge_url("café").ends_with("&q=caf%C3%A9"));
+    }
+
+    #[test]
+    fn move_file_moves_once() {
+        let dir = std::env::temp_dir().join(format!("glancecards-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        std::fs::write(&a, b"x").unwrap();
+        move_file(&a, &b).unwrap();
+        assert!(!a.exists() && b.exists());
+        assert_eq!(unique_path(&b), dir.join("b (1).png"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

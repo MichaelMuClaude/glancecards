@@ -99,7 +99,26 @@ pub fn save(st: &Settings) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&path, out) {
+    // Write a temporary file and rename it over the old one, so a crash mid-write never leaves a half file.
+    let tmp = path.with_extension("txt.tmp");
+    if let Err(e) = std::fs::write(&tmp, out).and_then(|()| std::fs::rename(&tmp, &path)) {
         eprintln!("could not save settings to {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Holds a lock on a file in the settings folder for as long as the app runs, so a second copy (from the
+/// app menu while the autostart copy is open) can tell and quit. The lock goes away when the process
+/// ends, even after a crash. Returns None when another copy holds it.
+pub fn single_instance() -> Option<Option<std::fs::File>> {
+    let Some(dir) = file_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return Some(None) };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock")) else {
+        return Some(None); // cannot tell, so do not block starting
+    };
+    match file.try_lock() {
+        Ok(()) => Some(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(_)) => Some(None),
     }
 }
