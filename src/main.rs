@@ -490,9 +490,9 @@ impl App {
                     ui.label(tr("换一张卡片", ""));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(tr("句子卡：每", "Sentence cards: one after every"));
+                    ui.label(tr("句子卡和生词卡：每", "Sentence and own-word cards: one after every"));
                     ui.add(egui::DragValue::new(&mut every).range(0..=100));
-                    ui.label(tr("张单词卡后出一张（0 = 不特别安排）", "word cards (0 = no special place)"));
+                    ui.label(tr("张其他卡后出一张（0 = 不特别安排）", "other cards (0 = no special place)"));
                 });
                 ui.checkbox(&mut fit, tr("窗口贴合每张卡片的形状", "Fit the window to each card's shape"));
                 ui.separator();
@@ -847,13 +847,19 @@ fn is_sentence(p: &Path) -> bool {
     p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("sentence_"))
 }
 
-/// Shuffles the cards for a new round and spreads the sentence cards through it: one after every `every`
-/// word cards, going round the sentences again and again, so a handful of sentences come back often
-/// instead of once in thousands of cards. `every` = 0 shuffles them in like any other card, once each.
+/// Cards you are learning right now, shown more often: sentence cards and the words you looked up
+/// yourself ("mine_<word>.png").
+fn is_featured(p: &Path) -> bool {
+    is_sentence(p) || p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("mine_"))
+}
+
+/// Shuffles the cards for a new round and spreads the featured cards (sentences and your own words)
+/// through it: one after every `every` other cards, going round them again and again, so a handful come
+/// back often instead of once in thousands of cards. `every` = 0 shuffles them in like any other card.
 fn arrange(cards: Vec<PathBuf>, every: usize) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let (mut sentences, mut words): (Vec<_>, Vec<_>) =
-        cards.into_iter().filter(|p| seen.insert(p.clone())).partition(|p| is_sentence(p));
+        cards.into_iter().filter(|p| seen.insert(p.clone())).partition(|p| is_featured(p));
     let rng = &mut rand::rng();
     if every == 0 || sentences.is_empty() || words.is_empty() {
         words.append(&mut sentences);
@@ -878,11 +884,13 @@ fn arrange(cards: Vec<PathBuf>, every: usize) -> Vec<PathBuf> {
 
 /// The word a card shows, taken from its file name: "apple.png", "wa_according-to.jpg",
 /// or "apple (2).png" after a name clash in the known folder. A sentence card gives its key phrase
-/// ("sentence_005_figure-out.png" is "figure out").
+/// ("sentence_005_figure-out.png" is "figure out"); one of your own words drops its prefix
+/// ("mine_verge-collection.png" is "verge collection").
 fn card_word(p: &Path) -> Option<String> {
     let stem = p.file_stem()?.to_string_lossy();
-    if let Some(rest) = stem.strip_prefix("sentence_") {
-        let phrase = rest.split_once('_').map_or(rest, |(_, k)| k);
+    let own = stem.strip_prefix("mine_");
+    if let Some(rest) = own.or_else(|| stem.strip_prefix("sentence_")) {
+        let phrase = if own.is_some() { rest } else { rest.split_once('_').map_or(rest, |(_, k)| k) };
         let phrase = phrase.split(" (").next().unwrap_or(phrase).replace('-', " ");
         let phrase = phrase.trim();
         return (!phrase.is_empty()).then(|| phrase.to_string());
@@ -1033,6 +1041,9 @@ mod tests {
         assert_eq!(card_word(Path::new("/x/wa_.jpg")), None);
         assert_eq!(card_word(Path::new("/x/sentence_005_figure-out.png")).as_deref(), Some("figure out"));
         assert_eq!(card_word(Path::new("/x/sentence_002_take-a-break (1).png")).as_deref(), Some("take a break"));
+        assert_eq!(card_word(Path::new("/x/mine_verge-collection.png")).as_deref(), Some("verge collection"));
+        assert_eq!(card_word(Path::new("/x/mine_tradie.jpg")).as_deref(), Some("tradie"));
+        assert!(is_featured(Path::new("/x/mine_tradie.png")) && !is_sentence(Path::new("/x/mine_tradie.png")));
     }
 
     #[test]

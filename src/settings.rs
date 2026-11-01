@@ -33,7 +33,8 @@ pub struct Settings {
     /// Where cards you already know are moved to; `None` means a `known` folder next to the first source folder.
     pub known: Option<PathBuf>,
     pub interval: u64,
-    /// A sentence card (`sentence_*`) comes after this many word cards; 0 = shuffled in like the others.
+    /// A sentence card (`sentence_*`) or own-word card (`mine_*`) comes after this many other cards;
+    /// 0 = shuffled in like the others.
     pub sentence_every: usize,
     pub fit: bool,
     pub level: Level,

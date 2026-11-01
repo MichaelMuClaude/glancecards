@@ -37,10 +37,11 @@ glancecards [--interval SECONDS] [--top | --normal | --bottom] [FOLDER...]
 - **Look up** (不认识, top left) opens the word in the Cambridge English–Chinese dictionary in your
   browser. The word is taken from the file name (`apple.png`, `wa_according-to.jpg`), so a few cards whose
   file names lost punctuation (a.m., baby-sit) land on Cambridge's spelling suggestions instead.
-- **Sentence cards**: pictures named `sentence_<id>_<key-phrase>.png` (made with `scripts/09_sentence_cards.py`
-  in wordcards) are mixed in more often than word cards: one after every 5 word cards by default, going round
-  the sentences again and again, and each stays twice as long. Change the 5 in Settings (0 shuffles them in
-  like any other card). Look up on a sentence card searches its key phrase.
+- **Sentence cards and your own words**: pictures named `sentence_<id>_<key-phrase>.png` (made with
+  `scripts/09_sentence_cards.py` in wordcards) and `mine_<word>.png` (words you looked up yourself, made with
+  `scripts/10_my_words.py`) are mixed in more often than the rest: one after every 5 other cards by default,
+  going round them again and again. Sentence cards stay twice as long. Change the 5 in Settings (0 shuffles
+  them in like any other card). Look up on a sentence card searches its key phrase.
 - **Previous** (left edge) goes back one card. The slideshow waits while the pointer is over the card.
 - Drag the card to move the window, drag the edges to resize it. Right-click for the menu and
   Settings (设置).
