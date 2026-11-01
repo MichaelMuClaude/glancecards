@@ -4,11 +4,13 @@
 // A release build on Windows is a window app: no console window next to it.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod cards;
 mod loader;
 mod settings;
+mod web;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -18,8 +20,8 @@ use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Id, Pos2, Rect, ResizeDirection, Sense, TextureHandle,
     TextureOptions, ViewportCommand, vec2,
 };
-use rand::seq::SliceRandom;
 
+use cards::{arrange, cambridge_url, card_word, is_sentence, move_file, unique_path};
 use loader::Loaded;
 use settings::{Level, Settings, home_dir};
 
@@ -99,6 +101,8 @@ struct Config {
     /// Where the window sits relative to other windows (the command line overrides the saved setting).
     level: Level,
     settings: Settings,
+    /// `--serve [ADDR]`: run the web page for phones instead of the window.
+    serve: Option<String>,
 }
 
 struct App {
@@ -344,10 +348,7 @@ impl App {
 
     /// Where learned cards go: the `known` setting, or a `known` folder next to the first source folder.
     fn known_dir(&self) -> PathBuf {
-        self.settings.known.clone().unwrap_or_else(|| {
-            let first = self.dirs.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-            first.parent().map(|p| p.join("known")).unwrap_or_else(|| first.join("known"))
-        })
+        cards::known_dir(self.settings.known.as_deref(), &self.dirs)
     }
 
     /// "I know this one": moves the current card to the known folder (Undo stays available).
@@ -841,91 +842,6 @@ impl eframe::App for App {
     }
 }
 
-fn unique_path(p: &Path) -> PathBuf {
-    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let dir = p.parent().unwrap_or(Path::new("."));
-    (1..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|c| !c.exists())
-        .expect("an unused name exists")
-}
-
-/// Sentence cards are named "sentence_<id>_<key-phrase>.png".
-fn is_sentence(p: &Path) -> bool {
-    p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("sentence_"))
-}
-
-/// Cards you are learning right now, shown more often: sentence cards and the words you looked up
-/// yourself ("mine_<word>.png").
-fn is_featured(p: &Path) -> bool {
-    is_sentence(p) || p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("mine_"))
-}
-
-/// Shuffles the cards for a new round and spreads the featured cards (sentences and your own words)
-/// through it: one after every `every` other cards, going round them again and again, so a handful come
-/// back often instead of once in thousands of cards. `every` = 0 shuffles them in like any other card.
-fn arrange(cards: Vec<PathBuf>, every: usize) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let (mut sentences, mut words): (Vec<_>, Vec<_>) =
-        cards.into_iter().filter(|p| seen.insert(p.clone())).partition(|p| is_featured(p));
-    let rng = &mut rand::rng();
-    if every == 0 || sentences.is_empty() || words.is_empty() {
-        words.append(&mut sentences);
-        words.shuffle(rng);
-        return words;
-    }
-    sentences.shuffle(rng);
-    words.shuffle(rng);
-    let n = words.len();
-    let slots = (n / every).max(sentences.len());
-    let mut out = Vec::with_capacity(n + slots);
-    let mut placed = 0;
-    for (i, w) in words.into_iter().enumerate() {
-        out.push(w);
-        while placed < slots && (placed + 1) * n / slots <= i + 1 {
-            out.push(sentences[placed % sentences.len()].clone());
-            placed += 1;
-        }
-    }
-    out
-}
-
-/// The word a card shows, taken from its file name: "apple.png", "wa_according-to.jpg",
-/// or "apple (2).png" after a name clash in the known folder. A sentence card gives its key phrase
-/// ("sentence_005_figure-out.png" is "figure out"); one of your own words drops its prefix
-/// ("mine_verge-collection.png" is "verge collection").
-fn card_word(p: &Path) -> Option<String> {
-    let stem = p.file_stem()?.to_string_lossy();
-    let own = stem.strip_prefix("mine_");
-    if let Some(rest) = own.or_else(|| stem.strip_prefix("sentence_")) {
-        let phrase = if own.is_some() { rest } else { rest.split_once('_').map_or(rest, |(_, k)| k) };
-        let phrase = phrase.split(" (").next().unwrap_or(phrase).replace('-', " ");
-        let phrase = phrase.trim();
-        return (!phrase.is_empty()).then(|| phrase.to_string());
-    }
-    let stem = stem.strip_prefix("wa_").unwrap_or(&stem);
-    let stem = match stem.rfind(" (") {
-        Some(i) if stem.ends_with(')') => &stem[..i],
-        _ => stem,
-    };
-    let word = stem.trim();
-    (!word.is_empty()).then(|| word.to_string())
-}
-
-/// Cambridge's direct search jumps to the entry, or to its spelling suggestions when there is none.
-fn cambridge_url(word: &str) -> String {
-    let q: String = word
-        .bytes()
-        .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
-            b' ' => "+".to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect();
-    format!("https://dictionary.cambridge.org/search/direct/?datasetsearch=english-chinese-simplified&q={q}")
-}
-
 /// Opens a web page in the default browser without waiting for it.
 fn open_url(url: &str) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -953,20 +869,6 @@ fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Renames, or copies and deletes when the folders are on different drives.
-fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(from, to)?;
-    if let Err(e) = std::fs::remove_file(from) {
-        // Leave one copy, not two: the card stays where it was.
-        let _ = std::fs::remove_file(to);
-        return Err(e);
-    }
-    Ok(())
-}
-
 /// Wayland compositors (GNOME, KDE) have no "stay below other windows" level, so there the
 /// frame opens as an ordinary window instead of trying to sit on the desktop.
 fn is_wayland() -> bool {
@@ -977,9 +879,14 @@ fn parse_args(st: &Settings) -> Config {
     let mut dirs = Vec::new();
     let mut interval = st.interval;
     let mut level = None;
-    let mut args = std::env::args().skip(1);
+    let mut serve = None;
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--serve" => {
+                let addr = args.next_if(|v| v.contains(':')).unwrap_or_else(|| "127.0.0.1:8090".to_string());
+                serve = Some(addr);
+            }
             "--interval" | "-i" => {
                 if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
                     interval = v;
@@ -990,7 +897,7 @@ fn parse_args(st: &Settings) -> Config {
             "--bottom" => level = Some(Level::Bottom),
             "--help" | "-h" => {
                 println!(
-                    "glancecards (词卡) [--interval SECONDS] [--top | --normal | --bottom] [FOLDER...]\n\nDefault folder: ~/word-images/learning, default interval: 10s.\n--top floats above other windows, --normal is an ordinary window, --bottom sits below all windows like a desktop widget (X11 only; the default). These override the setting in the settings window."
+                    "glancecards (词卡) [--interval SECONDS] [--top | --normal | --bottom] [--serve [ADDR]] [FOLDER...]\n\nDefault folder: ~/word-images/learning, default interval: 10s.\n--top floats above other windows, --normal is an ordinary window, --bottom sits below all windows like a desktop widget (X11 only; the default). These override the setting in the settings window.\n--serve runs the web page for phones instead of the window (default 127.0.0.1:8090; there is no sign-in, so keep it on 127.0.0.1 behind an HTTPS proxy such as tailscale serve)."
                 );
                 std::process::exit(0);
             }
@@ -1007,12 +914,19 @@ fn parse_args(st: &Settings) -> Config {
     if level == Level::Bottom && is_wayland() {
         level = Level::Normal; // Wayland has no "below all windows"
     }
-    Config { dirs, interval: Duration::from_secs(interval.max(1)), level, settings: st.clone() }
+    Config { dirs, interval: Duration::from_secs(interval.max(1)), level, settings: st.clone(), serve }
 }
 
 fn main() -> eframe::Result {
     let st = settings::load();
     let cfg = parse_args(&st);
+    if let Some(addr) = &cfg.serve {
+        // The web page runs on its own, next to the window if that is open too.
+        let mut st = cfg.settings.clone();
+        st.interval = cfg.interval.as_secs();
+        web::serve(addr, cfg.dirs.clone(), &st);
+        return Ok(());
+    }
     // Keep the lock until the app quits.
     let Some(_lock) = settings::single_instance() else {
         eprintln!("GlanceCards (词卡) is already running.");
@@ -1036,60 +950,4 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, cfg.take().expect("single init"))))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn word_from_file_name() {
-        assert_eq!(card_word(Path::new("/x/apple.png")).as_deref(), Some("apple"));
-        assert_eq!(card_word(Path::new("/x/wa_according-to.jpg")).as_deref(), Some("according-to"));
-        assert_eq!(card_word(Path::new("/x/apple (2).png")).as_deref(), Some("apple"));
-        assert_eq!(card_word(Path::new("/x/wa_.jpg")), None);
-        assert_eq!(card_word(Path::new("/x/sentence_005_figure-out.png")).as_deref(), Some("figure out"));
-        assert_eq!(card_word(Path::new("/x/sentence_002_take-a-break (1).png")).as_deref(), Some("take a break"));
-        assert_eq!(card_word(Path::new("/x/mine_verge-collection.png")).as_deref(), Some("verge collection"));
-        assert_eq!(card_word(Path::new("/x/mine_tradie.jpg")).as_deref(), Some("tradie"));
-        assert!(is_featured(Path::new("/x/mine_tradie.png")) && !is_sentence(Path::new("/x/mine_tradie.png")));
-    }
-
-    #[test]
-    fn sentences_are_spread_through_the_round() {
-        let words: Vec<PathBuf> = (0..100).map(|i| PathBuf::from(format!("w{i}.png"))).collect();
-        let sentences: Vec<PathBuf> = (1..=3).map(|i| PathBuf::from(format!("sentence_00{i}_x.png"))).collect();
-        let all: Vec<PathBuf> = words.iter().chain(&sentences).cloned().collect();
-        let q = arrange(all.clone(), 5);
-        assert_eq!(q.len(), 120);
-        assert_eq!(q.iter().filter(|p| !is_sentence(p)).count(), 100);
-        // Never two sentences in a row, and every sentence comes back several times.
-        assert!(q.windows(2).all(|w| !(is_sentence(&w[0]) && is_sentence(&w[1]))));
-        assert!(sentences.iter().all(|s| q.iter().filter(|p| *p == s).count() >= 6));
-        // A round that already holds repeats is rebuilt from one copy of each card.
-        assert_eq!(arrange(q, 5).len(), 120);
-        // 0 turns it off; fewer words than `every` still shows each sentence once.
-        assert_eq!(arrange(all, 0).len(), 103);
-        assert_eq!(arrange(vec![words[0].clone()].into_iter().chain(sentences.clone()).collect(), 5).len(), 4);
-    }
-
-    #[test]
-    fn cambridge_query_is_encoded() {
-        assert!(cambridge_url("according-to").ends_with("&q=according-to"));
-        assert!(cambridge_url("ice cream").ends_with("&q=ice+cream"));
-        assert!(cambridge_url("o'clock&x").ends_with("&q=o%27clock%26x"));
-        assert!(cambridge_url("café").ends_with("&q=caf%C3%A9"));
-    }
-
-    #[test]
-    fn move_file_moves_once() {
-        let dir = std::env::temp_dir().join(format!("glancecards-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
-        std::fs::write(&a, b"x").unwrap();
-        move_file(&a, &b).unwrap();
-        assert!(!a.exists() && b.exists());
-        assert_eq!(unique_path(&b), dir.join("b (1).png"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 }

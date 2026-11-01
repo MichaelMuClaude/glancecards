@@ -66,6 +66,24 @@ pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) 
     (job_tx, res_rx)
 }
 
+/// Every picture in the folders, found right away on the calling thread (the web server's way).
+pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        scan(dir, &mut found);
+    }
+    found
+}
+
+/// Opens a picture, turned the right way up.
+pub fn open_image(path: &Path) -> Result<image::DynamicImage, String> {
+    #[cfg(feature = "heif")]
+    if is_heif(path) {
+        return decode_heif(path);
+    }
+    decode_std(path)
+}
+
 fn is_hidden(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
 }

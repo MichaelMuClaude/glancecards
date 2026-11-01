@@ -8,7 +8,8 @@ you already know a word, click **Got it** and the card moves to a `known` folder
 干活时随手瞄几眼就能记单词。认识的点右上角的"认识了"，这张卡就移到 `known` 文件夹，不再出现；不认识的点左上角的"不认识"，
 会在浏览器里打开这个词的剑桥英汉词典页面。界面是中文的
 （需要系统里有中文字体，没有的话自动用英文）。右键 → "设置…" 里可以选窗口是悬浮在其他窗口之上、普通窗口，
-还是沉在其他窗口之下（像桌面小部件）。卡片见 [wordcards](https://github.com/MichaelMuClaude/wordcards)。
+还是沉在其他窗口之下（像桌面小部件）。`glancecards --serve` 还能把卡片做成手机网页：上滑下一张、下滑上一张、
+左右滑就是"认识了"，像刷短视频一样（见下面 "On your phone"）。卡片见 [wordcards](https://github.com/MichaelMuClaude/wordcards)。
 
 ![GlanceCards showing a card](docs/screenshot.png)
 
@@ -54,6 +55,52 @@ glancecards [--interval SECONDS] [--top | --normal | --bottom] [FOLDER...]
 
 Got it moves your real files. It is a move, not a delete, and Undo works, but try it on a copy first.
 
+## On your phone
+
+`glancecards --serve` runs the same cards as a web page instead of the window, so you can flick through
+them on a phone like a short-video app:
+
+- **swipe up**: next card; **swipe down**: the card before;
+- **swipe left or right**: Got it (the card moves to the `known` folder; Undo stays for 8 seconds);
+- **tap**: pause or carry on; **Look up** (不认识) opens the Cambridge dictionary;
+- left alone, it moves on by itself (sentence cards stay twice as long) and keeps the screen on.
+
+The cards stay on the computer: the phone asks for one card at a time and gets it as a small JPEG
+(about 70 KB instead of a 1 MB PNG). Got it on the phone moves the real file, so the window and the phone
+share one set of cards, and new cards in the folder show up on the phone within 5 minutes.
+
+The page has **no sign-in**: anyone who can reach it can move your cards. Keep it on `127.0.0.1` and reach it
+through something that lets in only your own devices and adds HTTPS (needed for "Add to Home Screen" as an
+app and for keeping the screen on), for example [Tailscale](https://tailscale.com/kb/1312/serve):
+
+```
+glancecards --serve 127.0.0.1:8090 ~/word-images/learning
+tailscale serve --bg --https=8443 http://127.0.0.1:8090
+```
+
+Then open `https://<your computer>.<your tailnet>.ts.net:8443` on the phone and add it to the home screen.
+To start it with the computer, a systemd user service works (with `loginctl enable-linger` it runs before
+you log in):
+
+```
+# ~/.config/systemd/user/glancecards-web.service
+[Unit]
+Description=GlanceCards web page
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/glancecards --serve 127.0.0.1:8090 %h/word-images/learning
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```
+systemctl --user enable --now glancecards-web.service
+```
+
 ## Windows
 
 A Windows build is made by cross-compiling on Linux (or build natively on Windows):
@@ -84,6 +131,7 @@ The binary is `target/release/glancecards`.
 ## Status
 
 Tried only on Linux with an X11 session. The Windows build and Wayland behaviour have not been tested.
+The phone page was tried in a phone-sized desktop browser and on an iPhone (Safari) over Tailscale.
 
 ## License
 

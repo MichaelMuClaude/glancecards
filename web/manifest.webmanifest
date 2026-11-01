@@ -1,0 +1,14 @@
+{
+  "name": "词卡 GlanceCards",
+  "short_name": "词卡",
+  "description": "单词和句子卡片，自动轮播",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#faf7f0",
+  "theme_color": "#faf7f0",
+  "icons": [
+    { "src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
