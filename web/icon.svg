@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#7A4A20" flood-opacity="0.28"/>
+    </filter>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFD9A8"/>
+      <stop offset="1" stop-color="#FFF1DC"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="#FAF3E6"/>
+  <g transform="translate(10 4)">
+  <!-- next card peeking from below -->
+  <g transform="rotate(7 256 300)" filter="url(#sh)">
+    <rect x="132" y="160" width="248" height="300" rx="30" fill="#3E9A6A"/>
+    <rect x="186" y="392" width="140" height="20" rx="10" fill="#FAF3E6" opacity="0.85"/>
+  </g>
+  <!-- current card, swiped up and to the side -->
+  <g transform="rotate(-10 256 220)" filter="url(#sh)">
+    <rect x="128" y="56" width="256" height="320" rx="30" fill="#DA5F2E"/>
+    <clipPath id="pic"><rect x="148" y="76" width="216" height="200" rx="16"/></clipPath>
+    <g clip-path="url(#pic)">
+      <rect x="148" y="76" width="216" height="200" fill="url(#sky)"/>
+      <circle cx="300" cy="130" r="26" fill="#FFB238"/>
+      <path d="M148 236 Q206 186 262 222 T364 214 L364 276 L148 276 Z" fill="#79C47F"/>
+      <path d="M148 258 Q230 220 296 252 T364 248 L364 276 L148 276 Z" fill="#4E9E63"/>
+    </g>
+    <rect x="186" y="300" width="140" height="22" rx="11" fill="#FFF8EE"/>
+    <rect x="212" y="336" width="88" height="16" rx="8" fill="#FFF8EE" opacity="0.7"/>
+  </g>
+  </g>
+</svg>

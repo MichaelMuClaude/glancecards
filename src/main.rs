@@ -1048,6 +1048,13 @@ fn parse_args(st: &Settings) -> Config {
     Config { dirs, interval: Duration::from_secs(interval.max(1)), level, settings: st.clone(), serve, server }
 }
 
+/// The window icon: the phone page's home-screen icon, shrunk (window managers show it small).
+fn window_icon() -> egui::IconData {
+    let Ok(img) = image::load_from_memory(include_bytes!("../web/icon.png")) else { return egui::IconData::default() };
+    let rgba = img.resize(128, 128, image::imageops::FilterType::Triangle).to_rgba8();
+    egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() }
+}
+
 fn main() -> eframe::Result {
     let st = settings::load();
     let cfg = parse_args(&st);
@@ -1068,6 +1075,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("词卡 GlanceCards")
             .with_app_id("glancecards")
+            // The same picture as the phone page's home-screen icon (Alt+Tab, window lists).
+            .with_icon(Arc::new(window_icon()))
             .with_inner_size([300.0, 420.0])
             .with_min_inner_size([200.0, 160.0])
             .with_decorations(false)
