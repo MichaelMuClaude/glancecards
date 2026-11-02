@@ -6,6 +6,7 @@
 
 mod cards;
 mod loader;
+mod remote;
 mod settings;
 mod web;
 
@@ -23,6 +24,7 @@ use eframe::egui::{
 
 use cards::{arrange, cambridge_url, card_word, is_sentence, move_file, unique_path};
 use loader::Loaded;
+use remote::Remote;
 use settings::{Level, Settings, home_dir};
 
 /// Background behind the card: the same cream as the strip under each picture, so a card that does not
@@ -32,6 +34,12 @@ const EDGE: f32 = 7.0;
 const TOAST_SECS: u64 = 8;
 /// The longest a card waits after Look up for you to come back from the dictionary.
 const LOOKUP_HOLD: Duration = Duration::from_secs(60);
+/// With a server: ask for more cards once fewer than this many are left ahead.
+const AHEAD: usize = 10;
+/// With a server: how long to wait before asking again after it could not be reached.
+const RETRY: Duration = Duration::from_secs(30);
+/// With a server: cards kept behind the current one (for Back) before the oldest are dropped.
+const BEHIND: usize = 200;
 
 /// Whether the interface is in Chinese. It is, unless no Chinese font can be found on the system.
 static ZH: AtomicBool = AtomicBool::new(false);
@@ -88,6 +96,15 @@ fn window_level(level: Level) -> egui::WindowLevel {
 /// What the Undo button in the toast can reverse.
 enum Undo {
     Moved { from: PathBuf, to: PathBuf },
+    /// Got it on the server: the server remembers what to move back.
+    Remote,
+}
+
+/// Answers from the server, sent back by the threads that talk to it.
+enum Net {
+    Batch(Result<Vec<PathBuf>, String>),
+    Known(PathBuf, Result<(), String>),
+    Undone(Result<PathBuf, String>),
 }
 
 /// What a folder-picker dialog was opened for.
@@ -103,6 +120,8 @@ struct Config {
     settings: Settings,
     /// `--serve [ADDR]`: run the web page for phones instead of the window.
     serve: Option<String>,
+    /// `--server URL` or the `server` setting: show that server's cards instead of the folders.
+    server: Option<String>,
 }
 
 struct App {
@@ -139,14 +158,29 @@ struct App {
     fit_aspect: Option<f32>,
     /// Photos shown before the current one, most recent last.
     history: Vec<PathBuf>,
+    /// The server the cards come from, if any (then `dirs` is not read).
+    remote: Option<Arc<Remote>>,
+    net_tx: Sender<Net>,
+    net_rx: Receiver<Net>,
+    /// A request for more cards is on its way.
+    fetching: bool,
+    /// The last time the server could not be reached, and why.
+    net_error: Option<(String, Instant)>,
 }
 
 impl App {
     fn new(ctx: &egui::Context, cfg: Config) -> Self {
         ZH.store(install_cjk_font(ctx), Ordering::Relaxed);
-        let scan_rx = loader::spawn_scan(ctx.clone(), cfg.dirs.clone());
-        let (job_tx, res_rx) = loader::spawn_workers(ctx.clone());
+        let remote = cfg.server.as_deref().map(|s| Arc::new(Remote::new(s)));
+        let scan_rx = if remote.is_some() { mpsc::channel().1 } else { loader::spawn_scan(ctx.clone(), cfg.dirs.clone()) };
+        let (job_tx, res_rx) = loader::spawn_workers(ctx.clone(), remote.clone());
+        let (net_tx, net_rx) = mpsc::channel();
         Self {
+            remote,
+            net_tx,
+            net_rx,
+            fetching: false,
+            net_error: None,
             queue: Vec::new(),
             pos: 0,
             scan_rx,
@@ -254,6 +288,10 @@ impl App {
             self.pos = 0;
             self.scanned = true;
         }
+        while let Ok(msg) = self.net_rx.try_recv() {
+            self.on_net(msg);
+        }
+        self.fetch_more(ctx);
         while let Ok(res) = self.res_rx.try_recv() {
             match res {
                 Loaded::Ok(path, img) => {
@@ -282,6 +320,68 @@ impl App {
         }
     }
 
+    /// With a server: asks for more cards when few are left ahead, unless it was just found unreachable.
+    fn fetch_more(&mut self, ctx: &egui::Context) {
+        let Some(remote) = self.remote.clone() else { return };
+        let resting = self.net_error.as_ref().is_some_and(|(_, at)| at.elapsed() < RETRY);
+        if self.fetching || resting || self.queue.len().saturating_sub(self.pos) >= AHEAD {
+            return;
+        }
+        self.fetching = true;
+        let (tx, ctx) = (self.net_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Net::Batch(remote.next(remote::BATCH)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn on_net(&mut self, msg: Net) {
+        match msg {
+            Net::Batch(Ok(cards)) => {
+                self.fetching = false;
+                self.scanned = true;
+                self.net_error = None;
+                self.queue.extend(cards);
+                // A window left running for weeks must not keep every card it has shown.
+                if self.pos > BEHIND * 2 {
+                    self.queue.drain(..BEHIND);
+                    self.pos -= BEHIND;
+                }
+            }
+            Net::Batch(Err(e)) => {
+                self.fetching = false;
+                self.scanned = true;
+                self.net_error = Some((e, Instant::now()));
+            }
+            Net::Known(_, Ok(())) => {
+                self.last_action = Some(Undo::Remote);
+                self.toast = Some((format!("{} known", tr("已移到", "Moved to")), Instant::now(), true));
+            }
+            Net::Known(path, Err(e)) => {
+                // The card was taken off the screen right away; bring it back since the server kept it.
+                self.toast = Some((format!("{}: {e}", tr("移动失败", "Move failed")), Instant::now(), false));
+                self.reinsert(path);
+            }
+            Net::Undone(Ok(path)) => {
+                self.reinsert(path);
+                self.toast = Some((tr("已放回去", "Moved back").to_string(), Instant::now(), false));
+            }
+            Net::Undone(Err(e)) => {
+                self.toast = Some((format!("{}: {e}", tr("撤销失败", "Undo failed")), Instant::now(), false));
+            }
+        }
+    }
+
+    /// Runs a request to the server on its own thread and hands the answer to `on_net`.
+    fn ask_server(&self, ctx: &egui::Context, call: impl FnOnce(&Remote) -> Net + Send + 'static) {
+        let Some(remote) = self.remote.clone() else { return };
+        let (tx, ctx) = (self.net_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(call(&remote));
+            ctx.request_repaint();
+        });
+    }
+
     /// Removes every copy of the card (sentence cards appear several times in a round).
     fn remove_from_queue(&mut self, path: &PathBuf) {
         while let Some(i) = self.queue.iter().position(|p| p == path) {
@@ -290,7 +390,8 @@ impl App {
                 self.pos -= 1;
             }
         }
-        if self.pos >= self.queue.len() {
+        // With a server, the end of the queue waits for the next cards instead of starting over.
+        if self.pos >= self.queue.len() && self.remote.is_none() {
             self.pos = 0;
         }
     }
@@ -315,7 +416,10 @@ impl App {
                 }
             }
             self.pos += 1;
-            if self.pos >= n {
+            if self.pos >= n && self.remote.is_some() {
+                // The server's next cards are on their way (fetch_more asks well before this).
+                self.pos = n;
+            } else if self.pos >= n {
                 self.pos = 0;
                 self.queue = arrange(std::mem::take(&mut self.queue), self.settings.sentence_every);
                 // A new round must not start with the card that ended the last one.
@@ -352,8 +456,17 @@ impl App {
     }
 
     /// "I know this one": moves the current card to the known folder (Undo stays available).
-    fn mark_known(&mut self) {
+    fn mark_known(&mut self, ctx: &egui::Context) {
         let Some((path, _)) = self.shown.clone() else { return };
+        if self.remote.is_some() {
+            // Off the screen at once; the server moves it (on_net puts it back if that fails).
+            self.cache.remove(&path);
+            self.shown = None;
+            self.remove_from_queue(&path);
+            let id = path.clone();
+            self.ask_server(ctx, move |r| Net::Known(id.clone(), r.known(&id)));
+            return;
+        }
         let dir = self.known_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.toast = Some((format!("{} {}: {e}", tr("无法创建", "Cannot create"), dir.display()), Instant::now(), false));
@@ -366,8 +479,13 @@ impl App {
         self.pick.is_some()
     }
 
-    fn undo(&mut self) {
+    fn undo(&mut self, ctx: &egui::Context) {
         let msg = match self.last_action.take() {
+            Some(Undo::Remote) => {
+                self.ask_server(ctx, |r| Net::Undone(r.undo()));
+                self.toast = None;
+                return;
+            }
             Some(Undo::Moved { from, to }) => {
                 let dest = if from.exists() { unique_path(&from) } else { from };
                 match move_file(&to, &dest) {
@@ -464,6 +582,7 @@ impl App {
             .with_inner_size([560.0, 500.0])
             .with_min_inner_size([400.0, 380.0]);
         let dirs = self.dirs.clone();
+        let server = self.remote.as_ref().map(|r| r.base().to_string());
         let mut secs = self.interval.as_secs();
         let mut every = self.settings.sentence_every;
         let mut fit = self.fit;
@@ -472,20 +591,28 @@ impl App {
         let (mut close, mut add, mut remove) = (false, false, None::<usize>);
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("glancecards-settings"), builder, |ctx, _| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(tr("卡片文件夹", "Card folders"));
-                ui.label(tr("从这些文件夹（包括里面的子文件夹）里随机抽取卡片。", "Cards are picked at random from these folders and everything inside them."));
-                ui.add_space(6.0);
-                for (i, d) in dirs.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(dirs.len() > 1, egui::Button::new(tr("移除", "Remove"))).clicked() {
-                            remove = Some(i);
-                        }
-                        ui.label(d.display().to_string());
-                    });
-                }
-                ui.add_space(4.0);
-                if ui.button(tr("添加文件夹…", "Add folder...")).clicked() {
-                    add = true;
+                if let Some(server) = &server {
+                    ui.heading(tr("卡片服务器", "Card server"));
+                    ui.label(tr("卡片来自这台服务器，“认识了”也记在那里（和手机共用）。", "Cards come from this server, and Got it is recorded there (shared with the phone)."));
+                    ui.add_space(6.0);
+                    ui.label(server);
+                    ui.weak(tr("要改回读本机文件夹，删掉设置文件里的 server= 这一行。", "To read local folders again, remove the server= line from the settings file."));
+                } else {
+                    ui.heading(tr("卡片文件夹", "Card folders"));
+                    ui.label(tr("从这些文件夹（包括里面的子文件夹）里随机抽取卡片。", "Cards are picked at random from these folders and everything inside them."));
+                    ui.add_space(6.0);
+                    for (i, d) in dirs.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(dirs.len() > 1, egui::Button::new(tr("移除", "Remove"))).clicked() {
+                                remove = Some(i);
+                            }
+                            ui.label(d.display().to_string());
+                        });
+                    }
+                    ui.add_space(4.0);
+                    if ui.button(tr("添加文件夹…", "Add folder...")).clicked() {
+                        add = true;
+                    }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -633,7 +760,7 @@ impl eframe::App for App {
         }
         // Holding Delete repeats the key; one card per key press, not a run of them.
         if del && self.shown_since.elapsed() >= Duration::from_millis(400) {
-            self.mark_known();
+            self.mark_known(&ctx);
         }
         if pause {
             self.paused = !self.paused;
@@ -674,8 +801,10 @@ impl eframe::App for App {
                 );
             }
             None => {
-                let msg = if !self.scanned {
-                    tr("正在扫描卡片…", "Scanning cards...")
+                let msg = if self.remote.is_some() && self.net_error.is_some() && self.current_path().is_none() {
+                    tr("连不上卡片服务器，稍后自动重试", "Cannot reach the card server; trying again soon")
+                } else if !self.scanned {
+                    if self.remote.is_some() { tr("正在连接卡片服务器…", "Connecting to the card server...") } else { tr("正在扫描卡片…", "Scanning cards...") }
                 } else if self.queue.is_empty() {
                     tr("没有找到卡片", "No cards found")
                 } else {
@@ -781,7 +910,7 @@ impl eframe::App for App {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
             }
             if resp.clicked() && settled {
-                self.mark_known();
+                self.mark_known(&ctx);
             }
             // "Don't know" button: opens the word in the Cambridge English–Chinese dictionary.
             if let Some(word) = self.shown.as_ref().and_then(|(p, _)| card_word(p)) {
@@ -830,7 +959,7 @@ impl eframe::App for App {
                     painter.rect_filled(ub, 5.0, fill);
                     painter.text(ub.center(), Align2::CENTER_CENTER, tr("撤销", "Undo"), FontId::proportional(13.0), Color32::WHITE);
                     if resp.clicked() {
-                        self.undo();
+                        self.undo(&ctx);
                     }
                 }
             }
@@ -880,9 +1009,11 @@ fn parse_args(st: &Settings) -> Config {
     let mut interval = st.interval;
     let mut level = None;
     let mut serve = None;
+    let mut server = st.server.clone();
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--server" => server = args.next(),
             "--serve" => {
                 let addr = args.next_if(|v| v.contains(':')).unwrap_or_else(|| "127.0.0.1:8090".to_string());
                 serve = Some(addr);
@@ -897,7 +1028,7 @@ fn parse_args(st: &Settings) -> Config {
             "--bottom" => level = Some(Level::Bottom),
             "--help" | "-h" => {
                 println!(
-                    "glancecards (词卡) [--interval SECONDS] [--top | --normal | --bottom] [--serve [ADDR]] [FOLDER...]\n\nDefault folder: ~/word-images/learning, default interval: 10s.\n--top floats above other windows, --normal is an ordinary window, --bottom sits below all windows like a desktop widget (X11 only; the default). These override the setting in the settings window.\n--serve runs the web page for phones instead of the window (default 127.0.0.1:8090; there is no sign-in, so keep it on 127.0.0.1 behind an HTTPS proxy such as tailscale serve)."
+                    "glancecards (词卡) [--interval SECONDS] [--top | --normal | --bottom] [--serve [ADDR] | --server URL] [FOLDER...]\n\nDefault folder: ~/word-images/learning, default interval: 10s.\n--top floats above other windows, --normal is an ordinary window, --bottom sits below all windows like a desktop widget (X11 only; the default). These override the setting in the settings window.\n--serve runs the web page for phones instead of the window (default 127.0.0.1:8090; there is no sign-in, so keep it on 127.0.0.1 behind an HTTPS proxy such as tailscale serve).\n--server URL shows the cards of a glancecards --serve server (for example https://host:8443) instead of reading folders; Got it is sent there. The server= line in the settings file does the same."
                 );
                 std::process::exit(0);
             }
@@ -914,7 +1045,7 @@ fn parse_args(st: &Settings) -> Config {
     if level == Level::Bottom && is_wayland() {
         level = Level::Normal; // Wayland has no "below all windows"
     }
-    Config { dirs, interval: Duration::from_secs(interval.max(1)), level, settings: st.clone(), serve }
+    Config { dirs, interval: Duration::from_secs(interval.max(1)), level, settings: st.clone(), serve, server }
 }
 
 fn main() -> eframe::Result {

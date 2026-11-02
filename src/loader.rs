@@ -8,6 +8,8 @@ use std::thread;
 use eframe::egui::{self, ColorImage};
 use image::ImageDecoder;
 
+use crate::remote::Remote;
+
 /// Longest side photos are shrunk to before they become textures.
 const MAX_SIDE: u32 = 2048;
 const WORKERS: usize = 2;
@@ -35,8 +37,9 @@ pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>) -> Receiver<Vec<PathBu
     scan_rx
 }
 
-/// Starts the decoder threads. Returns (job sender, decoded images).
-pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) {
+/// Starts the decoder threads. With a server, a card's path is its id there and the picture is downloaded.
+/// Returns (job sender, decoded images).
+pub fn spawn_workers(ctx: egui::Context, remote: Option<Arc<Remote>>) -> (Sender<PathBuf>, Receiver<Loaded>) {
     let (job_tx, job_rx) = mpsc::channel::<PathBuf>();
     let (res_tx, res_rx) = mpsc::channel();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -44,13 +47,18 @@ pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) 
         let job_rx = Arc::clone(&job_rx);
         let res_tx = res_tx.clone();
         let ctx = ctx.clone();
+        let remote = remote.clone();
         thread::spawn(move || {
             loop {
                 let job = job_rx.lock().ok().and_then(|rx| rx.recv().ok());
                 let Some(path) = job else { break };
                 // A decoder that panics on a broken file must not take the worker down with it: the card
                 // would stay "loading" forever and the slideshow would stop on it.
-                let result = std::panic::catch_unwind(|| decode(&path))
+                let bytes = remote.as_ref().map(|r| r.image(&path));
+                let result = std::panic::catch_unwind(|| match bytes {
+                    Some(bytes) => decode_bytes(bytes?),
+                    None => decode(&path),
+                })
                     .unwrap_or_else(|_| Err("the decoder crashed on this file".to_string()));
                 let msg = match result {
                     Ok(img) => Loaded::Ok(path, img),
@@ -116,6 +124,16 @@ fn decode(path: &Path) -> Result<ColorImage, String> {
     let img = if is_heif(path) { decode_heif(path)? } else { decode_std(path)? };
     #[cfg(not(feature = "heif"))]
     let img = decode_std(path)?;
+    Ok(to_color_image(img))
+}
+
+/// A picture downloaded from the server.
+fn decode_bytes(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    Ok(to_color_image(img))
+}
+
+fn to_color_image(img: image::DynamicImage) -> ColorImage {
     let img = if img.width().max(img.height()) > MAX_SIDE {
         img.thumbnail(MAX_SIDE, MAX_SIDE)
     } else {
@@ -123,7 +141,7 @@ fn decode(path: &Path) -> Result<ColorImage, String> {
     };
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+    ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
 fn decode_std(path: &Path) -> Result<image::DynamicImage, String> {

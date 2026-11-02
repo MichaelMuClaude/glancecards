@@ -106,6 +106,19 @@ WantedBy=default.target
 systemctl --user enable --now glancecards-web.service
 ```
 
+### The window on another computer
+
+The server can live on a small always-on machine while the desktop window runs elsewhere. Start the window
+with the server's address, or put the same address in the settings file as a `server=` line:
+
+```
+glancecards --server https://<server>.<your tailnet>.ts.net:8443
+```
+
+The window then shows the server's cards in the server's order and sends Got it and Undo there, exactly like
+the phone, so there is only one set of cards to keep. Folders given on the command line are ignored. If the
+server cannot be reached, the window says so and tries again every 30 seconds.
+
 ## Windows
 
 A Windows build is made by cross-compiling on Linux (or build natively on Windows):

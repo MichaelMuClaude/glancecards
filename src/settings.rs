@@ -38,11 +38,23 @@ pub struct Settings {
     pub sentence_every: usize,
     pub fit: bool,
     pub level: Level,
+    /// A `glancecards --serve` address (for example `https://host:8443`): the window then shows that
+    /// server's cards instead of reading the folders.
+    pub server: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), recent: Vec::new(), known: None, interval: 10, sentence_every: 5, fit: true, level: Level::Bottom }
+        Self {
+            dirs: Vec::new(),
+            recent: Vec::new(),
+            known: None,
+            interval: 10,
+            sentence_every: 5,
+            fit: true,
+            level: Level::Bottom,
+            server: None,
+        }
     }
 }
 
@@ -67,6 +79,7 @@ pub fn load() -> Settings {
             "dir" => st.dirs.push(PathBuf::from(value)),
             "recent" => st.recent.push(PathBuf::from(value)),
             "known" => st.known = Some(PathBuf::from(value)),
+            "server" => st.server = Some(value.trim().to_string()).filter(|s| !s.is_empty()),
             "interval" => {
                 if let Ok(n) = value.trim().parse::<u64>() {
                     st.interval = n.clamp(1, 3600);
@@ -102,6 +115,9 @@ pub fn save(st: &Settings) {
     }
     if let Some(k) = &st.known {
         out.push_str(&format!("known={}\n", k.display()));
+    }
+    if let Some(s) = &st.server {
+        out.push_str(&format!("server={s}\n"));
     }
     out.push_str(&format!(
         "interval={}\nsentence_every={}\nfit={}\nlevel={}\n",

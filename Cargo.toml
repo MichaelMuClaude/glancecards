@@ -18,7 +18,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 libheif-rs = { version = "3.0.0", default-features = false, features = ["v1_17"], optional = true }
 rand = "0.9"
 rfd = "0.17.2"
+serde_json = "1.0.154"
 tiny_http = "0.12"
+ureq = "3"
 walkdir = "2.5.0"
 
 # Linux and macOS draw with OpenGL. Windows uses wgpu (Direct3D 12 or Vulkan) because plain OpenGL is missing or too old
